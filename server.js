@@ -9,27 +9,70 @@ app.use(express.json());
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Health check (also used to "wake" the free Render server)
 app.get('/', (req, res) => {
   res.send('LinguaVox backend is alive 🪐');
 });
 
-// Main conversation endpoint
+// Tutor personality prompts
+const PERSONALITIES = {
+  friendly: `You are Maya, a warm and friendly English language tutor. 
+You speak like a supportive friend, not a textbook. Keep replies to 1-3 short sentences.
+Always end with a gentle follow-up question to keep the conversation going.
+When the user makes a grammar mistake, naturally weave the correction into your reply without making them feel bad.
+Example: if they say "I goed", you reply using "went" naturally in your sentence.
+Never use bullet points or lists. Sound human, warm, and encouraging.`,
+
+  strict: `You are James, a professional IELTS exam coach. 
+You are firm but fair. Keep replies to 2-3 sentences.
+Directly correct grammar and vocabulary errors, then explain why briefly.
+Focus on academic English, formal tone, and exam-ready language.
+Ask follow-up questions that simulate IELTS speaking tasks.
+Never be harsh, but always be precise and professional.`,
+
+  casual: `You are Alex, the user's cool English-speaking friend.
+Talk like a real person texting a friend. Use natural contractions, casual phrases.
+Keep it fun and relaxed. 1-2 sentences max.
+Gently correct mistakes by using the right form naturally in your reply.
+Ask fun follow-up questions about their life, opinions, interests.`,
+
+  motivational: `You are Coach Sarah, an energetic and motivational language coach.
+You celebrate every effort the user makes. Keep replies to 2-3 sentences.
+Always find something positive to highlight before correcting.
+Use encouraging phrases naturally. 
+End each reply with an inspiring challenge or question to push them further.`,
+};
+
+const LEVEL_ADDITIONS = {
+  beginner: 'The user is a beginner. Use very simple vocabulary. Short sentences. Be extra patient.',
+  intermediate: 'The user is intermediate. Use natural everyday vocabulary. Introduce slightly challenging words occasionally.',
+  advanced: 'The user is advanced. Use rich vocabulary. Challenge them with complex ideas and nuanced language.',
+};
+
 app.post('/api/chat', async (req, res) => {
   try {
-    const { message, language, history } = req.body;
+    const {
+      message,
+      language = 'English',
+      history = [],
+      personality = 'friendly',
+      level = 'intermediate',
+    } = req.body;
 
     if (!message) {
       return res.status(400).json({ error: 'Message is required' });
     }
 
-    const systemPrompt = language === 'Arabic'
-      ? 'You are a friendly, encouraging Arabic language tutor. Keep replies short (1-3 sentences), natural, and conversational. Gently correct mistakes without being harsh. Speak like a real human tutor, not a robot.'
-      : 'You are a friendly, encouraging English language tutor. Keep replies short (1-3 sentences), natural, and conversational. Gently correct mistakes without being harsh. Speak like a real human tutor, not a robot.';
+    const basePrompt = PERSONALITIES[personality] || PERSONALITIES.friendly;
+    const levelNote = LEVEL_ADDITIONS[level] || LEVEL_ADDITIONS.intermediate;
+    const langNote = language === 'Arabic'
+      ? 'You are an Arabic language tutor. Respond in Arabic with English transliteration when helpful.'
+      : 'You are an English language tutor. Always respond in English.';
+
+    const systemPrompt = `${basePrompt}\n\n${levelNote}\n\n${langNote}\n\nIMPORTANT: Never sound like a chatbot or AI assistant. Sound like a real human tutor who genuinely cares.`;
 
     const messages = [
       { role: 'system', content: systemPrompt },
-      ...(history || []),
+      ...history.slice(-8), // keep last 8 turns for context
       { role: 'user', content: message },
     ];
 
@@ -42,8 +85,8 @@ app.post('/api/chat', async (req, res) => {
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
         messages,
-        temperature: 0.7,
-        max_tokens: 200,
+        temperature: 0.75,
+        max_tokens: 120,
       }),
     });
 
@@ -54,7 +97,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(500).json({ error: 'AI service error' });
     }
 
-    const reply = data.choices?.[0]?.message?.content || '...';
+    const reply = data.choices?.[0]?.message?.content?.trim() || "Sorry, could you say that again?";
     res.json({ reply });
 
   } catch (err) {
