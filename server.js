@@ -24,17 +24,31 @@ app.post('/api/chat', async (req, res) => {
       memoryContext = null, // short summary from Lingua Memory
     } = req.body;
 
-    if (!message) return res.status(400).json({ error: 'Message required' });
+    // FIX: only treat this as "no input" when the message is actually
+    // empty/unreadable — never for valid short messages like "hey".
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'empty_message' });
+    }
 
     const isArabic = language === 'Arabic';
 
-    const systemPrompt = buildSystemPrompt({
-      personality,
-      level,
-      language,
-      nativeLanguage,
-      memoryContext,
-    });
+    let systemPrompt;
+    try {
+      systemPrompt = buildSystemPrompt({
+        personality,
+        level,
+        language,
+        nativeLanguage,
+        memoryContext,
+      });
+    } catch (buildErr) {
+      // FIX: if the prompt-building engine itself throws (bad personality
+      // key, bad level, etc.), this used to bubble into the generic catch
+      // below and look identical to a Groq failure. Logging it separately
+      // here makes the real cause visible instead of guessing.
+      console.error('[chat] promptBuilder error:', buildErr);
+      return res.status(500).json({ error: 'prompt_build_failed' });
+    }
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -42,35 +56,57 @@ app.post('/api/chat', async (req, res) => {
       { role: 'user', content: message },
     ];
 
-    const response = await fetch(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages,
-        temperature: 0.75,
-        max_tokens: 150,
-      }),
-    });
+    let response;
+    try {
+      response = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'llama-3.3-70b-versatile',
+          messages,
+          temperature: 0.75,
+          max_tokens: 150,
+        }),
+      });
+    } catch (networkErr) {
+      // FIX: a network-level failure reaching Groq at all (DNS, timeout,
+      // Groq down) is now logged and returned as a distinct error, not
+      // silently turned into "sorry, could you say that again?"
+      console.error('[chat] Groq network error:', networkErr);
+      return res.status(502).json({ error: 'groq_unreachable' });
+    }
 
     if (!response.ok) {
-      const err = await response.json();
-      console.error('Groq error:', err);
-      return res.status(500).json({ error: 'AI error' });
+      let errBody = null;
+      try { errBody = await response.json(); } catch (_) {}
+      // This log is the important one, jani — check Render's logs after
+      // this deploys and this line will show you EXACTLY why Groq is
+      // rejecting requests (bad/missing API key, deprecated model name,
+      // rate limit, etc.) instead of guessing.
+      console.error('[chat] Groq returned', response.status, JSON.stringify(errBody));
+      return res.status(502).json({ error: 'groq_error', status: response.status });
     }
 
     const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim()
-      || (isArabic ? 'عذراً، هل يمكنك إعادة ذلك؟' : "Sorry, could you say that again?");
+    const reply = data.choices?.[0]?.message?.content?.trim();
+
+    if (!reply) {
+      console.error('[chat] Groq returned 200 but no reply content:', JSON.stringify(data));
+      return res.status(502).json({ error: 'empty_ai_response' });
+    }
+
+    // Debug logging, as requested — shows the real user input next to
+    // the real AI output for every successful exchange.
+    console.log(`[chat] user="${message}" -> reply="${reply}"`);
 
     res.json({ reply });
 
   } catch (err) {
-    console.error('Server error:', err);
-    res.status(500).json({ error: 'Server error' });
+    console.error('[chat] Unexpected server error:', err);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 
