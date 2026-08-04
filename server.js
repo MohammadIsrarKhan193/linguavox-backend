@@ -131,7 +131,10 @@ JSON:
   "mistakes": "one sentence about the main grammar or vocabulary issue, or null if none",
   "tip": "one concrete actionable improvement tip",
   "fluency": 6,
-  "encouragement": "one warm encouraging sentence"
+  "encouragement": "one warm encouraging sentence",
+  "vocabulary": ["word or phrase actually used or taught in this conversation"],
+  "grammarPoint": "the main grammar point practiced this session, or null if none clearly stood out",
+  "nextLessonSuggestion": "one short, natural suggestion for what to focus on next lesson"
 }`;
 
     const response = await fetch(GROQ_URL, {
