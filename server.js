@@ -22,6 +22,7 @@ app.post('/api/chat', async (req, res) => {
       level = 'intermediate',
       nativeLanguage = null, // e.g. 'pashto', 'dari', 'urdu'
       memoryContext = null, // short summary from Lingua Memory
+      courseFocus = null, // current Lesson Journey lesson topic, if any
     } = req.body;
 
     // FIX: only treat this as "no input" when the message is actually
@@ -40,6 +41,7 @@ app.post('/api/chat', async (req, res) => {
         language,
         nativeLanguage,
         memoryContext,
+        courseFocus,
       });
     } catch (buildErr) {
       // FIX: if the prompt-building engine itself throws (bad personality
