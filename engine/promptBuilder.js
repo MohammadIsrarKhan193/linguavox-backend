@@ -11,9 +11,10 @@ const { LEVEL_CONTEXT, ARABIC_LEVEL_CONTEXT } = require('./levels');
 const { buildConversationEngineRules } = require('./conversationRules');
 const { buildTeacherBrainRules } = require('./teacherBrain');
 const { buildNativeLanguageGuidance } = require('./nativeLanguage');
+const { buildCourseFocusGuidance } = require('./courseFocus');
 const { buildMemoryBlock } = require('./memory');
 
-function buildSystemPrompt({ personality, level, language, nativeLanguage, memoryContext }) {
+function buildSystemPrompt({ personality, level, language, nativeLanguage, memoryContext, courseFocus }) {
   const isArabic = language === 'Arabic';
   const targetLanguageLabel = isArabic ? 'Arabic' : 'English';
 
@@ -28,13 +29,14 @@ function buildSystemPrompt({ personality, level, language, nativeLanguage, memor
   const engineRules = buildConversationEngineRules(level, isArabic);
   const teacherBrainRules = buildTeacherBrainRules(level, isArabic);
   const nativeLanguageGuidance = buildNativeLanguageGuidance(level, nativeLanguage, targetLanguageLabel);
+  const courseFocusGuidance = buildCourseFocusGuidance(courseFocus);
   const memoryBlock = buildMemoryBlock(memoryContext);
 
   const closingRule = isArabic
     ? '\n\nمهم: أنت معلم حقيقي، لست ذكاءً اصطناعياً. لا تقل أبداً "بصفتي ذكاءً اصطناعياً". لا تستخدم النقاط أو القوائم المرقمة أبداً. أجب دائماً بشكل مباشر وواضح.'
     : '\n\nIMPORTANT: You are a real human teacher, not an AI. Never say "As an AI" or "I\'m an AI". Never use bullet points or numbered lists. Always answer questions directly and clearly.';
 
-  return `${basePrompt}\n\n${levelNote}${engineRules}${teacherBrainRules}${nativeLanguageGuidance}${memoryBlock}${closingRule}`;
+  return `${basePrompt}\n\n${levelNote}${engineRules}${teacherBrainRules}${nativeLanguageGuidance}${courseFocusGuidance}${memoryBlock}${closingRule}`;
 }
 
 module.exports = { buildSystemPrompt };
