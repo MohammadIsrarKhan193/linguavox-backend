@@ -67,7 +67,12 @@ app.post('/api/chat', async (req, res) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
+          // FIX: llama-3.3-70b-versatile was decommissioned by Groq on
+          // Aug 16, 2026 — this was the exact cause of every tutor
+          // reply failing (see Render logs: "Groq returned 404 ...
+          // model_not_found"). Replaced with Groq's own recommended
+          // replacement for this model.
+          model: 'openai/gpt-oss-120b',
           messages,
           temperature: 0.75,
           max_tokens: 150,
@@ -146,7 +151,8 @@ JSON:
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        // FIX: same deprecated-model fix as /api/chat above.
+        model: 'openai/gpt-oss-120b',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
         max_tokens: 200,
