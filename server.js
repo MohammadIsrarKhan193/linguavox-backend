@@ -72,10 +72,19 @@ app.post('/api/chat', async (req, res) => {
           // reply failing (see Render logs: "Groq returned 404 ...
           // model_not_found"). Replaced with Groq's own recommended
           // replacement for this model.
+          // FIX: openai/gpt-oss-120b is a REASONING model — it spends
+          // completion tokens on hidden thinking before writing the
+          // actual reply, and that thinking counts against max_tokens.
+          // At the default ("medium") effort, 150 tokens was consumed
+          // entirely by reasoning, leaving 0 tokens for content (see
+          // Render logs: completion_tokens:150, reasoning_tokens:148,
+          // content:""). reasoning_effort:'low' keeps thinking short,
+          // and a bigger max_tokens gives real headroom either way.
           model: 'openai/gpt-oss-120b',
           messages,
-          temperature: 0.75,
-          max_tokens: 150,
+          temperature: 0.7,
+          max_tokens: 400,
+          reasoning_effort: 'low',
         }),
       });
     } catch (networkErr) {
@@ -152,10 +161,12 @@ JSON:
       },
       body: JSON.stringify({
         // FIX: same deprecated-model fix as /api/chat above.
+        // FIX: same reasoning-model issue as /api/chat above.
         model: 'openai/gpt-oss-120b',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 200,
+        max_tokens: 450,
+        reasoning_effort: 'low',
       }),
     });
 
