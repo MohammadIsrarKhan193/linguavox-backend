@@ -136,17 +136,29 @@ app.post('/api/summary', async (req, res) => {
       .map(m => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
       .join('\n');
 
+    // FIX: the old template had a literal `"fluency": 6` as the example
+    // value in the JSON schema below. Models — especially at low
+    // temperature (0.3, used for this call) — tend to anchor on a
+    // literal example number instead of generating a genuine
+    // session-specific score, which is exactly why fluency was coming
+    // back as 6/10 on nearly every single conversation regardless of
+    // actual performance. Replaced with an explicit instruction
+    // instead of a copyable number, plus a reinforcing line above the
+    // schema so every field is genuinely derived from THIS
+    // conversation, not defaulted.
     const prompt = `Analyze this language learning conversation. Respond in valid JSON only, no markdown, no explanation.
 
 Conversation:
 ${conversation}
+
+Every value below must be your own genuine assessment of THIS specific conversation — never copy a placeholder or default to a safe middle value. If the student did well, score it high; if they struggled, score it low. Two different conversations should very rarely get the same fluency score unless performance was genuinely similar.
 
 JSON:
 {
   "strengths": "one specific sentence about what the student did well",
   "mistakes": "one sentence about the main grammar or vocabulary issue, or null if none",
   "tip": "one concrete actionable improvement tip",
-  "fluency": 6,
+  "fluency": "integer from 1 to 10 — your honest, specific rating of THIS conversation's fluency, not a default",
   "encouragement": "one warm encouraging sentence",
   "vocabulary": ["word or phrase actually used or taught in this conversation"],
   "grammarPoint": "the main grammar point practiced this session, or null if none clearly stood out",
