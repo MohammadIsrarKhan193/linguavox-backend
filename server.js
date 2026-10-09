@@ -129,12 +129,26 @@ app.post('/api/chat', async (req, res) => {
 // Session summary
 app.post('/api/summary', async (req, res) => {
   try {
-    const { history = [], language = 'English' } = req.body;
+    // NEW: optional — when a conversation is tied to a real Academy
+    // lesson, the caller can pass its title + real completionCriteria
+    // so this endpoint can genuinely assess whether THIS conversation
+    // met it, instead of lesson completion being decided purely by
+    // "did the conversation have 3+ messages". Both fully optional —
+    // omitting them keeps this endpoint's existing behavior unchanged.
+    const { history = [], language = 'English', lessonTitle = null, completionCriteria = null } = req.body;
     if (history.length < 2) return res.json({ summary: null });
 
     const conversation = history
       .map(m => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
       .join('\n');
+
+    const completionBlock = completionCriteria
+      ? `
+
+This conversation was a lesson on "${lessonTitle || 'the current topic'}". Its real completion criteria is:
+${completionCriteria}
+Judge honestly whether THIS conversation actually demonstrates that — not whether the student was pleasant or tried hard, specifically whether the stated criteria was met.`
+      : '';
 
     // FIX: the old template had a literal `"fluency": 6` as the example
     // value in the JSON schema below. Models — especially at low
@@ -151,7 +165,7 @@ app.post('/api/summary', async (req, res) => {
 Conversation:
 ${conversation}
 
-Every value below must be your own genuine assessment of THIS specific conversation — never copy a placeholder or default to a safe middle value. If the student did well, score it high; if they struggled, score it low. Two different conversations should very rarely get the same fluency score unless performance was genuinely similar.
+Every value below must be your own genuine assessment of THIS specific conversation — never copy a placeholder or default to a safe middle value. If the student did well, score it high; if they struggled, score it low. Two different conversations should very rarely get the same fluency score unless performance was genuinely similar.${completionBlock}
 
 JSON:
 {
@@ -162,7 +176,9 @@ JSON:
   "encouragement": "one warm encouraging sentence",
   "vocabulary": ["word or phrase actually used or taught in this conversation"],
   "grammarPoint": "the main grammar point practiced this session, or null if none clearly stood out",
-  "nextLessonSuggestion": "one short, natural suggestion for what to focus on next lesson"
+  "nextLessonSuggestion": "one short, natural suggestion for what to focus on next lesson"${completionCriteria ? `,
+  "completionCriteriaMet": "true or false — your honest judgment, not optimistic by default",
+  "gapNote": "if not met: one short, specific sentence on what still needs work. If met: null"` : ''}
 }`;
 
     const response = await fetch(GROQ_URL, {
@@ -177,7 +193,7 @@ JSON:
         model: 'openai/gpt-oss-120b',
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 450,
+        max_tokens: 520, // bumped slightly for the two new optional completion-check fields
         reasoning_effort: 'low',
       }),
     });
