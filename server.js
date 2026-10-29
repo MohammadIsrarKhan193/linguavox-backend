@@ -1,166 +1,258 @@
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 require('dotenv').config();
 const { buildSystemPrompt } = require('./engine/promptBuilder');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
+// Render sits behind a proxy; this makes req.ip the real caller's IP
+// (needed for the flood guard below).
+app.set('trust proxy', 1);
+app.use(cors());
+app.use(express.json({ limit: '100kb' }));
+
+// ------------------------------------------------------------
+// CONFIG
+// The AI model name lives in Render's Environment settings, so if
+// Groq ever retires a model again you change ONE setting in the
+// Render dashboard — no code change, no redeploy of code.
+//   GROQ_MODEL           (optional) default: openai/gpt-oss-120b
+//   GROQ_FALLBACK_MODEL  (optional) tried automatically if the main
+//                        model fails, e.g. openai/gpt-oss-20b
+// ------------------------------------------------------------
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const PRIMARY_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
+const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || null;
+const GROQ_TIMEOUT_MS = 25000;
 
-app.get('/', (req, res) => res.send('LinguaVox backend is alive 🪐'));
+if (!GROQ_API_KEY) {
+  console.error('[startup] GROQ_API_KEY is missing — every AI request will fail. Set it in Render → Environment.');
+}
 
-app.post('/api/chat', async (req, res) => {
-  try {
-    const {
-      message,
-      language = 'English',
-      history = [],
-      personality = 'friendly',
-      level = 'intermediate',
-      nativeLanguage = null, // e.g. 'pashto', 'dari', 'urdu'
-      memoryContext = null, // short summary from Lingua Memory
-      courseFocus = null, // current Lesson Journey lesson topic, if any
-    } = req.body;
+// ------------------------------------------------------------
+// SAFETY HELPERS
+// ------------------------------------------------------------
+const MAX_TEXT = 2000; // max characters for one chat message
+const MAX_CONTEXT = 4000; // max characters for lesson focus / memory text
 
-    // FIX: only treat this as "no input" when the message is actually
-    // empty/unreadable — never for valid short messages like "hey".
-    if (!message || typeof message !== 'string' || !message.trim()) {
-      return res.status(400).json({ error: 'empty_message' });
+/// Simple flood guard per IP (no extra package needed). Generous on
+/// purpose: many people on mobile networks share one IP.
+function rateLimit({ windowMs, max }) {
+  const hits = new Map();
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of hits) {
+      if (now - entry.start > windowMs) hits.delete(key);
     }
+  }, windowMs).unref();
 
-    const isArabic = language === 'Arabic';
-
-    let systemPrompt;
-    try {
-      systemPrompt = buildSystemPrompt({
-        personality,
-        level,
-        language,
-        nativeLanguage,
-        memoryContext,
-        courseFocus,
-      });
-    } catch (buildErr) {
-      // FIX: if the prompt-building engine itself throws (bad personality
-      // key, bad level, etc.), this used to bubble into the generic catch
-      // below and look identical to a Groq failure. Logging it separately
-      // here makes the real cause visible instead of guessing.
-      console.error('[chat] promptBuilder error:', buildErr);
-      return res.status(500).json({ error: 'prompt_build_failed' });
+  return (req, res, next) => {
+    const now = Date.now();
+    let entry = hits.get(req.ip);
+    if (!entry || now - entry.start > windowMs) {
+      entry = { start: now, count: 0 };
+      hits.set(req.ip, entry);
     }
+    entry.count += 1;
+    if (entry.count > max) {
+      res.set('Retry-After', String(Math.ceil((entry.start + windowMs - now) / 1000)));
+      return res.status(429).json({ error: 'rate_limited' });
+    }
+    next();
+  };
+}
 
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...history.slice(-8),
-      { role: 'user', content: message },
-    ];
+/// Only ever 'user' or 'assistant' roles from the app — a caller can
+/// never inject a 'system' message to take over the tutor's rules.
+function cleanHistory(history, maxItems) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .slice(-maxItems)
+    .filter((m) => m && typeof m.content === 'string' && m.content.trim())
+    .map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.content.slice(0, MAX_TEXT),
+    }));
+}
 
-    let response;
+function optionalText(value, maxLength) {
+  if (value === null || value === undefined) return null;
+  return String(value).slice(0, maxLength);
+}
+
+/// One place that talks to Groq: timeout, optional fallback model,
+/// and clear failure information.
+async function callGroq({ messages, temperature, max_tokens }) {
+  const models = [PRIMARY_MODEL];
+  if (FALLBACK_MODEL && FALLBACK_MODEL !== PRIMARY_MODEL) models.push(FALLBACK_MODEL);
+
+  let lastFailure = { kind: 'network' };
+
+  for (const model of models) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
     try {
-      response = await fetch(GROQ_URL, {
+      const payload = { model, messages, temperature, max_tokens };
+      // gpt-oss models spend tokens "thinking" before they answer;
+      // keep that short so the reply itself always fits.
+      if (model.startsWith('openai/gpt-oss')) payload.reasoning_effort = 'low';
+
+      const response = await fetch(GROQ_URL, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${GROQ_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          // FIX: llama-3.3-70b-versatile was decommissioned by Groq on
-          // Aug 16, 2026 — this was the exact cause of every tutor
-          // reply failing (see Render logs: "Groq returned 404 ...
-          // model_not_found"). Replaced with Groq's own recommended
-          // replacement for this model.
-          // FIX: openai/gpt-oss-120b is a REASONING model — it spends
-          // completion tokens on hidden thinking before writing the
-          // actual reply, and that thinking counts against max_tokens.
-          // At the default ("medium") effort, 150 tokens was consumed
-          // entirely by reasoning, leaving 0 tokens for content (see
-          // Render logs: completion_tokens:150, reasoning_tokens:148,
-          // content:""). reasoning_effort:'low' keeps thinking short,
-          // and a bigger max_tokens gives real headroom either way.
-          model: 'openai/gpt-oss-120b',
-          messages,
-          temperature: 0.7,
-          max_tokens: 400,
-          reasoning_effort: 'low',
-        }),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-    } catch (networkErr) {
-      // FIX: a network-level failure reaching Groq at all (DNS, timeout,
-      // Groq down) is now logged and returned as a distinct error, not
-      // silently turned into "sorry, could you say that again?"
-      console.error('[chat] Groq network error:', networkErr);
-      return res.status(502).json({ error: 'groq_unreachable' });
-    }
 
-    if (!response.ok) {
+      if (response.ok) {
+        return { ok: true, data: await response.json(), model };
+      }
+
       let errBody = null;
       try { errBody = await response.json(); } catch (_) {}
-      // This log is the important one, jani — check Render's logs after
-      // this deploys and this line will show you EXACTLY why Groq is
-      // rejecting requests (bad/missing API key, deprecated model name,
-      // rate limit, etc.) instead of guessing.
-      console.error('[chat] Groq returned', response.status, JSON.stringify(errBody));
-      return res.status(502).json({ error: 'groq_error', status: response.status });
+      // Important log: shows exactly why Groq rejected the request
+      // (bad key, retired model, rate limit...).
+      console.error(`[groq] ${model} returned`, response.status, JSON.stringify(errBody));
+      lastFailure = { kind: 'http', status: response.status };
+    } catch (err) {
+      console.error(`[groq] ${model} failed:`, err && err.name === 'AbortError' ? 'timeout' : err);
+      lastFailure = { kind: 'network' };
+    } finally {
+      clearTimeout(timer);
     }
-
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content?.trim();
-
-    if (!reply) {
-      console.error('[chat] Groq returned 200 but no reply content:', JSON.stringify(data));
-      return res.status(502).json({ error: 'empty_ai_response' });
-    }
-
-    // Debug logging, as requested — shows the real user input next to
-    // the real AI output for every successful exchange.
-    console.log(`[chat] user="${message}" -> reply="${reply}"`);
-
-    res.json({ reply });
-
-  } catch (err) {
-    console.error('[chat] Unexpected server error:', err);
-    res.status(500).json({ error: 'server_error' });
   }
-});
 
-// Session summary
-app.post('/api/summary', async (req, res) => {
-  try {
-    // NEW: optional — when a conversation is tied to a real Academy
-    // lesson, the caller can pass its title + real completionCriteria
-    // so this endpoint can genuinely assess whether THIS conversation
-    // met it, instead of lesson completion being decided purely by
-    // "did the conversation have 3+ messages". Both fully optional —
-    // omitting them keeps this endpoint's existing behavior unchanged.
-    const { history = [], language = 'English', lessonTitle = null, completionCriteria = null } = req.body;
-    if (history.length < 2) return res.json({ summary: null });
+  return { ok: false, failure: lastFailure };
+}
 
-    const conversation = history
-      .map(m => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
-      .join('\n');
+// ------------------------------------------------------------
+// BASIC ROUTES
+// ------------------------------------------------------------
+app.get('/', (req, res) => res.send('LinguaVox backend is alive 🪐'));
 
-    const completionBlock = completionCriteria
-      ? `
+// Tiny and fast — point a free uptime monitor at this so Render's
+// free plan never goes to sleep.
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Pages required by Google Play (public web links).
+app.get('/privacy', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
+app.get('/delete-account', (req, res) =>
+  res.sendFile(path.join(__dirname, 'public', 'delete-account.html')));
+
+// ------------------------------------------------------------
+// CHAT
+// ------------------------------------------------------------
+app.post(
+  '/api/chat',
+  rateLimit({ windowMs: 60 * 1000, max: 120 }),
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      const {
+        message,
+        language = 'English',
+        personality = 'friendly',
+        level = 'intermediate',
+      } = body;
+
+      // Only "no input" when the message is truly empty — never for
+      // valid short messages like "hey".
+      if (!message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ error: 'empty_message' });
+      }
+
+      let systemPrompt;
+      try {
+        systemPrompt = buildSystemPrompt({
+          personality: String(personality).slice(0, 40),
+          level: String(level).slice(0, 40),
+          language: String(language).slice(0, 40),
+          nativeLanguage: optionalText(body.nativeLanguage, 40),
+          memoryContext: optionalText(body.memoryContext, MAX_CONTEXT),
+          courseFocus: optionalText(body.courseFocus, MAX_CONTEXT),
+        });
+      } catch (buildErr) {
+        // Prompt-building problems (bad personality key etc.) are
+        // logged separately so they're never mistaken for an AI outage.
+        console.error('[chat] promptBuilder error:', buildErr);
+        return res.status(500).json({ error: 'prompt_build_failed' });
+      }
+
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...cleanHistory(body.history, 8),
+        { role: 'user', content: message.slice(0, MAX_TEXT) },
+      ];
+
+      const result = await callGroq({ messages, temperature: 0.7, max_tokens: 400 });
+
+      if (!result.ok) {
+        if (result.failure.kind === 'http') {
+          return res.status(502).json({ error: 'groq_error', status: result.failure.status });
+        }
+        return res.status(502).json({ error: 'groq_unreachable' });
+      }
+
+      const reply = result.data.choices?.[0]?.message?.content?.trim();
+      if (!reply) {
+        console.error('[chat] AI returned 200 but no reply content:', JSON.stringify(result.data));
+        return res.status(502).json({ error: 'empty_ai_response' });
+      }
+
+      // Privacy: log sizes only — never the learner's private words.
+      console.log(
+        `[chat] ok model=${result.model} personality=${personality} level=${level} ` +
+        `inChars=${message.length} outChars=${reply.length}`
+      );
+
+      res.json({ reply });
+    } catch (err) {
+      console.error('[chat] Unexpected server error:', err);
+      res.status(500).json({ error: 'server_error' });
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// SESSION SUMMARY
+// ------------------------------------------------------------
+app.post(
+  '/api/summary',
+  rateLimit({ windowMs: 60 * 1000, max: 40 }),
+  async (req, res) => {
+    try {
+      const body = req.body || {};
+      // Optional: when a conversation is tied to a real Academy lesson,
+      // the caller passes its title + real completionCriteria so this
+      // endpoint can genuinely assess whether THIS conversation met it.
+      const lessonTitle = optionalText(body.lessonTitle, 200);
+      const completionCriteria = optionalText(body.completionCriteria, MAX_CONTEXT);
+      const history = cleanHistory(body.history, 40);
+
+      if (history.length < 2) return res.json({ summary: null });
+
+      const conversation = history
+        .map((m) => `${m.role === 'user' ? 'Student' : 'Tutor'}: ${m.content}`)
+        .join('\n');
+
+      const completionBlock = completionCriteria
+        ? `
 
 This conversation was a lesson on "${lessonTitle || 'the current topic'}". Its real completion criteria is:
 ${completionCriteria}
 Judge honestly whether THIS conversation actually demonstrates that — not whether the student was pleasant or tried hard, specifically whether the stated criteria was met.`
-      : '';
+        : '';
 
-    // FIX: the old template had a literal `"fluency": 6` as the example
-    // value in the JSON schema below. Models — especially at low
-    // temperature (0.3, used for this call) — tend to anchor on a
-    // literal example number instead of generating a genuine
-    // session-specific score, which is exactly why fluency was coming
-    // back as 6/10 on nearly every single conversation regardless of
-    // actual performance. Replaced with an explicit instruction
-    // instead of a copyable number, plus a reinforcing line above the
-    // schema so every field is genuinely derived from THIS
-    // conversation, not defaulted.
-    const prompt = `Analyze this language learning conversation. Respond in valid JSON only, no markdown, no explanation.
+      // The schema deliberately has NO example numbers: models anchor on
+      // a literal example, which used to make fluency come back as 6/10
+      // on nearly every conversation.
+      const prompt = `Analyze this language learning conversation. Respond in valid JSON only, no markdown, no explanation.
 
 Conversation:
 ${conversation}
@@ -181,35 +273,45 @@ JSON:
   "gapNote": "if not met: one short, specific sentence on what still needs work. If met: null"` : ''}
 }`;
 
-    const response = await fetch(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        // FIX: same deprecated-model fix as /api/chat above.
-        // FIX: same reasoning-model issue as /api/chat above.
-        model: 'openai/gpt-oss-120b',
+      const result = await callGroq({
         messages: [{ role: 'user', content: prompt }],
         temperature: 0.3,
-        max_tokens: 520, // bumped slightly for the two new optional completion-check fields
-        reasoning_effort: 'low',
-      }),
-    });
+        max_tokens: 520,
+      });
 
-    const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content?.trim() || '{}';
-    try {
-      const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
-      res.json({ summary: parsed });
-    } catch {
-      res.json({ summary: null });
+      // If the AI is unavailable, the app simply skips the summary
+      // (it already handles `summary: null`) instead of crashing.
+      if (!result.ok) return res.json({ summary: null });
+
+      const raw = result.data.choices?.[0]?.message?.content?.trim();
+      if (!raw) return res.json({ summary: null });
+
+      try {
+        const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
+        res.json({ summary: parsed });
+      } catch {
+        res.json({ summary: null });
+      }
+    } catch (err) {
+      console.error('[summary] Unexpected server error:', err);
+      res.status(500).json({ error: 'Summary error' });
     }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Summary error' });
   }
+);
+
+// ------------------------------------------------------------
+// LAST-RESORT ERROR HANDLER (bad JSON, oversized body, anything else)
+// Always answers with JSON — never an HTML error page.
+// ------------------------------------------------------------
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'bad_json' });
+  }
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'too_large' });
+  }
+  console.error('[server] Unexpected error:', err);
+  res.status(500).json({ error: 'server_error' });
 });
 
 const PORT = process.env.PORT || 3000;
