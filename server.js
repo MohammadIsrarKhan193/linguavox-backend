@@ -1,44 +1,70 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
+const admin = require('firebase-admin');
 require('dotenv').config();
 const { buildSystemPrompt } = require('./engine/promptBuilder');
 
 const app = express();
 
-// Render sits behind a proxy; this makes req.ip the real caller's IP
-// (needed for the flood guard below).
+// Render sits behind a proxy; this makes req.ip the real caller's IP.
 app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '100kb' }));
 
 // ------------------------------------------------------------
-// CONFIG
-// The AI model name lives in Render's Environment settings, so if
-// Groq ever retires a model again you change ONE setting in the
-// Render dashboard — no code change, no redeploy of code.
-//   GROQ_MODEL           (optional) default: openai/gpt-oss-120b
-//   GROQ_FALLBACK_MODEL  (optional) tried automatically if the main
-//                        model fails, e.g. openai/gpt-oss-20b
+// CONFIG (all changeable in Render → Environment, no code change)
+//   GROQ_API_KEY              required
+//   GROQ_MODEL                optional, default openai/gpt-oss-120b
+//   GROQ_FALLBACK_MODEL       optional, tried if the main model fails
+//   FIREBASE_SERVICE_ACCOUNT  required: the service-account JSON, as one line
+//   FREE_DAILY_CHATS          optional, default 20 AI replies per day (free)
+//   PRO_DAILY_CAP             optional, default 500 per day (Pro "unlimited"
+//                             fair-use guard so one account can't run up the bill)
+//   ADMIN_KEY                 optional: enables the /admin/set-pro tool
 // ------------------------------------------------------------
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const PRIMARY_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 const FALLBACK_MODEL = process.env.GROQ_FALLBACK_MODEL || null;
 const GROQ_TIMEOUT_MS = 25000;
+const FREE_DAILY_CHATS = parseInt(process.env.FREE_DAILY_CHATS || '20', 10);
+const PRO_DAILY_CAP = parseInt(process.env.PRO_DAILY_CAP || '500', 10);
+const ADMIN_KEY = process.env.ADMIN_KEY || null;
 
 if (!GROQ_API_KEY) {
-  console.error('[startup] GROQ_API_KEY is missing — every AI request will fail. Set it in Render → Environment.');
+  console.error('[startup] GROQ_API_KEY is missing — every AI request will fail.');
+}
+
+// ------------------------------------------------------------
+// FIREBASE ADMIN — verifies who is calling, reads their plan, and
+// keeps the daily usage counter. If it is not configured, the server
+// refuses AI requests (fails CLOSED) rather than letting anyone in
+// for free. /health shows whether it is working.
+// ------------------------------------------------------------
+let db = null;
+let authReady = false;
+try {
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (raw) {
+    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(raw)) });
+    db = admin.firestore();
+    authReady = true;
+  } else {
+    console.error('[startup] FIREBASE_SERVICE_ACCOUNT is missing — AI requests will be refused until it is set.');
+  }
+} catch (err) {
+  console.error('[startup] Firebase Admin failed to start:', err && err.message);
 }
 
 // ------------------------------------------------------------
 // SAFETY HELPERS
 // ------------------------------------------------------------
-const MAX_TEXT = 2000; // max characters for one chat message
-const MAX_CONTEXT = 4000; // max characters for lesson focus / memory text
+const MAX_TEXT = 2000;
+const MAX_CONTEXT = 4000;
 
-/// Simple flood guard per IP (no extra package needed). Generous on
-/// purpose: many people on mobile networks share one IP.
+/// Simple flood guard per IP (generous: many people share one mobile IP).
 function rateLimit({ windowMs, max }) {
   const hits = new Map();
   setInterval(() => {
@@ -64,8 +90,7 @@ function rateLimit({ windowMs, max }) {
   };
 }
 
-/// Only ever 'user' or 'assistant' roles from the app — a caller can
-/// never inject a 'system' message to take over the tutor's rules.
+/// Only 'user' / 'assistant' roles — a caller can never inject 'system'.
 function cleanHistory(history, maxItems) {
   if (!Array.isArray(history)) return [];
   return history
@@ -82,8 +107,81 @@ function optionalText(value, maxLength) {
   return String(value).slice(0, maxLength);
 }
 
-/// One place that talks to Groq: timeout, optional fallback model,
-/// and clear failure information.
+// ------------------------------------------------------------
+// WHO IS CALLING + WHAT PLAN THEY HAVE
+// ------------------------------------------------------------
+async function requireUser(req, res, next) {
+  if (!authReady) return res.status(503).json({ error: 'auth_unavailable' });
+  const match = (req.get('Authorization') || '').match(/^Bearer (.+)$/);
+  if (!match) return res.status(401).json({ error: 'unauthorized' });
+  try {
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+    req.uid = decoded.uid;
+    next();
+  } catch (_) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+}
+
+/// Pro = users/{uid}.plan == 'pro', and not past an optional proUntil date.
+/// Clients can NOT write these fields (Firestore rules), only this server
+/// and you (Firebase Console) can.
+function isProData(data) {
+  if (!data || data.plan !== 'pro') return false;
+  if (data.proUntil) {
+    const until = data.proUntil.toDate ? data.proUntil.toDate() : new Date(data.proUntil);
+    if (!isNaN(until) && until < new Date()) return false;
+  }
+  return true;
+}
+
+async function getIsPro(uid) {
+  const snap = await db.collection('users').doc(uid).get();
+  return isProData(snap.exists ? snap.data() : null);
+}
+
+// ------------------------------------------------------------
+// DAILY USAGE (counted per user per UTC day, server-side only)
+// ------------------------------------------------------------
+function dayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function usageRef(uid) {
+  return db.collection('users').doc(uid).collection('usage').doc(dayKey());
+}
+
+/// Atomically take one chat from today's allowance.
+async function reserveChat(uid, limit) {
+  const ref = usageRef(uid);
+  return db.runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const used = snap.exists ? snap.data().chats || 0 : 0;
+    if (used >= limit) return { allowed: false, used };
+    tx.set(
+      ref,
+      { chats: used + 1, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    return { allowed: true, used: used + 1 };
+  });
+}
+
+/// Give the chat back if the AI failed — users never lose a message to OUR error.
+async function refundChat(uid) {
+  try {
+    const ref = usageRef(uid);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      const used = snap.exists ? snap.data().chats || 0 : 0;
+      if (used > 0) tx.set(ref, { chats: used - 1 }, { merge: true });
+    });
+  } catch (err) {
+    console.error('[usage] refund failed:', err && err.message);
+  }
+}
+
+/// One place that talks to Groq: timeout, optional fallback model.
 async function callGroq({ messages, temperature, max_tokens }) {
   const models = [PRIMARY_MODEL];
   if (FALLBACK_MODEL && FALLBACK_MODEL !== PRIMARY_MODEL) models.push(FALLBACK_MODEL);
@@ -95,8 +193,6 @@ async function callGroq({ messages, temperature, max_tokens }) {
     const timer = setTimeout(() => controller.abort(), GROQ_TIMEOUT_MS);
     try {
       const payload = { model, messages, temperature, max_tokens };
-      // gpt-oss models spend tokens "thinking" before they answer;
-      // keep that short so the reply itself always fits.
       if (model.startsWith('openai/gpt-oss')) payload.reasoning_effort = 'low';
 
       const response = await fetch(GROQ_URL, {
@@ -115,8 +211,6 @@ async function callGroq({ messages, temperature, max_tokens }) {
 
       let errBody = null;
       try { errBody = await response.json(); } catch (_) {}
-      // Important log: shows exactly why Groq rejected the request
-      // (bad key, retired model, rate limit...).
       console.error(`[groq] ${model} returned`, response.status, JSON.stringify(errBody));
       lastFailure = { kind: 'http', status: response.status };
     } catch (err) {
@@ -135,23 +229,23 @@ async function callGroq({ messages, temperature, max_tokens }) {
 // ------------------------------------------------------------
 app.get('/', (req, res) => res.send('LinguaVox backend is alive 🪐'));
 
-// Tiny and fast — point a free uptime monitor at this so Render's
-// free plan never goes to sleep.
-app.get('/health', (req, res) => res.json({ ok: true }));
+// Point a free uptime monitor here. `auth: true` means Pro/limits are working.
+app.get('/health', (req, res) => res.json({ ok: true, auth: authReady }));
 
-// Pages required by Google Play (public web links).
 app.get('/privacy', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
 app.get('/delete-account', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'delete-account.html')));
 
 // ------------------------------------------------------------
-// CHAT
+// CHAT  (login required · free daily limit · Pro unlimited)
 // ------------------------------------------------------------
 app.post(
   '/api/chat',
   rateLimit({ windowMs: 60 * 1000, max: 120 }),
+  requireUser,
   async (req, res) => {
+    let reserved = false;
     try {
       const body = req.body || {};
       const {
@@ -161,11 +255,23 @@ app.post(
         level = 'intermediate',
       } = body;
 
-      // Only "no input" when the message is truly empty — never for
-      // valid short messages like "hey".
       if (!message || typeof message !== 'string' || !message.trim()) {
         return res.status(400).json({ error: 'empty_message' });
       }
+
+      // 1) Which plan? 2) Take one chat from today's allowance.
+      const isPro = await getIsPro(req.uid);
+      const limit = isPro ? PRO_DAILY_CAP : FREE_DAILY_CHATS;
+      const slot = await reserveChat(req.uid, limit);
+      if (!slot.allowed) {
+        return res.status(429).json({
+          error: 'daily_limit',
+          isPro,
+          used: slot.used,
+          limit: isPro ? null : limit,
+        });
+      }
+      reserved = true;
 
       let systemPrompt;
       try {
@@ -178,9 +284,8 @@ app.post(
           courseFocus: optionalText(body.courseFocus, MAX_CONTEXT),
         });
       } catch (buildErr) {
-        // Prompt-building problems (bad personality key etc.) are
-        // logged separately so they're never mistaken for an AI outage.
         console.error('[chat] promptBuilder error:', buildErr);
+        await refundChat(req.uid);
         return res.status(500).json({ error: 'prompt_build_failed' });
       }
 
@@ -193,6 +298,7 @@ app.post(
       const result = await callGroq({ messages, temperature: 0.7, max_tokens: 400 });
 
       if (!result.ok) {
+        await refundChat(req.uid);
         if (result.failure.kind === 'http') {
           return res.status(502).json({ error: 'groq_error', status: result.failure.status });
         }
@@ -202,35 +308,38 @@ app.post(
       const reply = result.data.choices?.[0]?.message?.content?.trim();
       if (!reply) {
         console.error('[chat] AI returned 200 but no reply content:', JSON.stringify(result.data));
+        await refundChat(req.uid);
         return res.status(502).json({ error: 'empty_ai_response' });
       }
 
       // Privacy: log sizes only — never the learner's private words.
       console.log(
-        `[chat] ok model=${result.model} personality=${personality} level=${level} ` +
-        `inChars=${message.length} outChars=${reply.length}`
+        `[chat] ok model=${result.model} pro=${isPro} personality=${personality} ` +
+        `level=${level} inChars=${message.length} outChars=${reply.length}`
       );
 
-      res.json({ reply });
+      res.json({
+        reply,
+        usage: { used: slot.used, limit: isPro ? null : limit, isPro },
+      });
     } catch (err) {
       console.error('[chat] Unexpected server error:', err);
+      if (reserved) await refundChat(req.uid);
       res.status(500).json({ error: 'server_error' });
     }
   }
 );
 
 // ------------------------------------------------------------
-// SESSION SUMMARY
+// SESSION SUMMARY (login required; does not use up a chat)
 // ------------------------------------------------------------
 app.post(
   '/api/summary',
   rateLimit({ windowMs: 60 * 1000, max: 40 }),
+  requireUser,
   async (req, res) => {
     try {
       const body = req.body || {};
-      // Optional: when a conversation is tied to a real Academy lesson,
-      // the caller passes its title + real completionCriteria so this
-      // endpoint can genuinely assess whether THIS conversation met it.
       const lessonTitle = optionalText(body.lessonTitle, 200);
       const completionCriteria = optionalText(body.completionCriteria, MAX_CONTEXT);
       const history = cleanHistory(body.history, 40);
@@ -249,9 +358,6 @@ ${completionCriteria}
 Judge honestly whether THIS conversation actually demonstrates that — not whether the student was pleasant or tried hard, specifically whether the stated criteria was met.`
         : '';
 
-      // The schema deliberately has NO example numbers: models anchor on
-      // a literal example, which used to make fluency come back as 6/10
-      // on nearly every conversation.
       const prompt = `Analyze this language learning conversation. Respond in valid JSON only, no markdown, no explanation.
 
 Conversation:
@@ -279,8 +385,6 @@ JSON:
         max_tokens: 520,
       });
 
-      // If the AI is unavailable, the app simply skips the summary
-      // (it already handles `summary: null`) instead of crashing.
       if (!result.ok) return res.json({ summary: null });
 
       const raw = result.data.choices?.[0]?.message?.content?.trim();
@@ -300,8 +404,77 @@ JSON:
 );
 
 // ------------------------------------------------------------
-// LAST-RESORT ERROR HANDLER (bad JSON, oversized body, anything else)
-// Always answers with JSON — never an HTML error page.
+// ADMIN: give (or remove) Pro for a person, by email.
+// Only works if you set ADMIN_KEY in Render. Use it for yourself,
+// friends and relatives. See the PowerShell example in the guide.
+//   POST /admin/set-pro   header: x-admin-key: <ADMIN_KEY>
+//   body: { "email": "friend@gmail.com", "pro": true, "days": 365 }
+//   "days" is optional — leave it out for Pro that never expires.
+// ------------------------------------------------------------
+function keysMatch(a, b) {
+  const ba = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+
+app.post(
+  '/admin/set-pro',
+  rateLimit({ windowMs: 60 * 1000, max: 20 }),
+  async (req, res) => {
+    if (!ADMIN_KEY || !authReady) return res.status(404).json({ error: 'not_found' });
+    if (!keysMatch(req.get('x-admin-key'), ADMIN_KEY)) {
+      return res.status(401).json({ error: 'unauthorized' });
+    }
+    try {
+      const { email, pro = true, days = null } = req.body || {};
+      if (!email || typeof email !== 'string') {
+        return res.status(400).json({ error: 'email_required' });
+      }
+
+      let userRecord;
+      try {
+        userRecord = await admin.auth().getUserByEmail(email.trim());
+      } catch (_) {
+        return res.status(404).json({ error: 'no_account_with_that_email' });
+      }
+
+      const ref = db.collection('users').doc(userRecord.uid);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        // Never create a half-empty profile: the person must open the
+        // app once so the app creates their real profile first.
+        return res.status(409).json({ error: 'user_must_open_the_app_once_first' });
+      }
+
+      if (pro) {
+        const update = { plan: 'pro', proSource: 'gift' };
+        if (days && Number(days) > 0) {
+          update.proUntil = admin.firestore.Timestamp.fromDate(
+            new Date(Date.now() + Number(days) * 86400000)
+          );
+        } else {
+          update.proUntil = admin.firestore.FieldValue.delete();
+        }
+        await ref.update(update);
+      } else {
+        await ref.update({
+          plan: 'free',
+          proSource: admin.firestore.FieldValue.delete(),
+          proUntil: admin.firestore.FieldValue.delete(),
+        });
+      }
+
+      console.log(`[admin] set-pro uid=${userRecord.uid} pro=${!!pro} days=${days || 'never'}`);
+      res.json({ ok: true, pro: !!pro });
+    } catch (err) {
+      console.error('[admin] set-pro error:', err);
+      res.status(500).json({ error: 'server_error' });
+    }
+  }
+);
+
+// ------------------------------------------------------------
+// LAST-RESORT ERROR HANDLER — always JSON, never an HTML error page.
 // ------------------------------------------------------------
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
@@ -316,3 +489,4 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`LinguaVox backend running on port ${PORT}`));
+        
