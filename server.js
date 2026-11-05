@@ -45,17 +45,49 @@ if (!GROQ_API_KEY) {
 // ------------------------------------------------------------
 let db = null;
 let authReady = false;
-try {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-  if (raw) {
-    admin.initializeApp({ credential: admin.credential.cert(JSON.parse(raw)) });
+let authReason = 'not_started'; // shown on /health so you can see WHY without digging in logs
+
+/// Reads the Firebase key from Render. Two ways, either works:
+///  - FIREBASE_SERVICE_ACCOUNT         the JSON pasted as text
+///  - FIREBASE_SERVICE_ACCOUNT_BASE64  the same JSON encoded as base64
+///    (the safest: web forms can't mangle it)
+function loadServiceAccount() {
+  let raw = process.env.FIREBASE_SERVICE_ACCOUNT_BASE64
+    ? Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64.trim(), 'base64').toString('utf8')
+    : process.env.FIREBASE_SERVICE_ACCOUNT;
+
+  if (!raw || !raw.trim()) return { error: 'missing' };
+  raw = raw.trim();
+  // Forgiving: remove quotes if the value was pasted with them.
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1);
+  }
+  try {
+    const account = JSON.parse(raw);
+    // Some hosts turn the key's \n into real line breaks or double slashes.
+    if (account.private_key) account.private_key = account.private_key.replace(/\\n/g, '\n');
+    return { account };
+  } catch (_) {
+    return { error: 'invalid_json' };
+  }
+}
+
+const loaded = loadServiceAccount();
+if (loaded.account) {
+  try {
+    admin.initializeApp({ credential: admin.credential.cert(loaded.account) });
     db = admin.firestore();
     authReady = true;
-  } else {
-    console.error('[startup] FIREBASE_SERVICE_ACCOUNT is missing — AI requests will be refused until it is set.');
+    authReason = 'ok';
+  } catch (err) {
+    authReason = 'init_failed';
+    console.error('[startup] Firebase Admin failed to start:', err && err.message);
   }
-} catch (err) {
-  console.error('[startup] Firebase Admin failed to start:', err && err.message);
+} else {
+  authReason = loaded.error;
+  console.error(
+    `[startup] Firebase key problem: ${loaded.error}. AI requests will be refused until it is fixed.`
+  );
 }
 
 // ------------------------------------------------------------
@@ -230,7 +262,8 @@ async function callGroq({ messages, temperature, max_tokens }) {
 app.get('/', (req, res) => res.send('LinguaVox backend is alive 🪐'));
 
 // Point a free uptime monitor here. `auth: true` means Pro/limits are working.
-app.get('/health', (req, res) => res.json({ ok: true, auth: authReady }));
+app.get('/health', (req, res) =>
+  res.json({ ok: true, auth: authReady, authReason: authReady ? undefined : authReason }));
 
 app.get('/privacy', (req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'privacy.html')));
@@ -489,4 +522,3 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`LinguaVox backend running on port ${PORT}`));
-        
