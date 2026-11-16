@@ -437,6 +437,26 @@ JSON:
 );
 
 // ------------------------------------------------------------
+// TODAY'S USAGE (read-only: shows "18/20 left today" without using a chat)
+// ------------------------------------------------------------
+app.get(
+  '/api/usage',
+  rateLimit({ windowMs: 60 * 1000, max: 60 }),
+  requireUser,
+  async (req, res) => {
+    try {
+      const isPro = await getIsPro(req.uid);
+      const snap = await usageRef(req.uid).get();
+      const used = snap.exists ? snap.data().chats || 0 : 0;
+      res.json({ usage: { used, limit: isPro ? null : FREE_DAILY_CHATS, isPro } });
+    } catch (err) {
+      console.error('[usage] error:', err && err.message);
+      res.status(500).json({ error: 'server_error' });
+    }
+  }
+);
+
+// ------------------------------------------------------------
 // ADMIN: give (or remove) Pro for a person, by email.
 // Only works if you set ADMIN_KEY in Render. Use it for yourself,
 // friends and relatives. See the PowerShell example in the guide.
@@ -507,18 +527,4 @@ app.post(
 );
 
 // ------------------------------------------------------------
-// LAST-RESORT ERROR HANDLER — always JSON, never an HTML error page.
-// ------------------------------------------------------------
-app.use((err, req, res, next) => {
-  if (err && err.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'bad_json' });
-  }
-  if (err && err.type === 'entity.too.large') {
-    return res.status(413).json({ error: 'too_large' });
-  }
-  console.error('[server] Unexpected error:', err);
-  res.status(500).json({ error: 'server_error' });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`LinguaVox backend running on port ${PORT}`));
+// LAST-RESORT ERROR HANDLER — always JSON, never an HTML err
